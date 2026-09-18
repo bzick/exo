@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
@@ -24,12 +25,21 @@ const SEND_TIMEOUT: Duration = Duration::from_millis(500);
 pub struct Discovery {
     sock: Arc<UdpSocket>,
     ifaces: Arc<Mutex<Vec<SocketAddrV6>>>,
+    /// every interface index netwatcher currently reports as present, kept in
+    /// sync independently of whatever `announce` has pruned from `ifaces` for
+    /// send failures -- the source of truth `resync_ifaces` rebuilds against.
+    known_ifaces: Arc<Mutex<HashSet<u32>>>,
+    discovery_port: u16,
     namespace: [u8; 8],
     last_nonce: Mutex<[u8; 8]>,
     /// the port of the service we are doing discovery for - transmitted to peers
     listen_port: u16,
     zid: ZenohId,
     tick: Interval,
+    /// periodically re-adds any interface still in `known_ifaces` but missing
+    /// from `ifaces`, so a send-side prune heals even when no netwatcher
+    /// interface event ever fires again to trigger the AddrInUse path below.
+    resync: Interval,
     _sync: Mutex<WatchHandle>,
 }
 
@@ -59,10 +69,12 @@ impl Discovery {
         sock.set_multicast_loop_v6(true)?;
         let sock = Arc::new(UdpSocket::from_std(sock.into())?);
         let ifaces: Arc<Mutex<Vec<SocketAddrV6>>> = Default::default();
+        let known_ifaces: Arc<Mutex<HashSet<u32>>> = Default::default();
         let _sync = Mutex::new(
             netwatcher::watch_interfaces_with_callback({
                 let sock = sock.clone();
                 let ifaces = ifaces.clone();
+                let known_ifaces = known_ifaces.clone();
                 move |update| {
                     for (iface_idx, iface) in update.interfaces.iter() {
                         if iface
@@ -93,6 +105,7 @@ impl Discovery {
                             }
                         };
                         if can_send {
+                            known_ifaces.lock().insert(*iface_idx);
                             let candidate =
                                 SocketAddrV6::new(GROUP, discovery_port, 0, *iface_idx);
                             let mut ifaces = ifaces.lock();
@@ -103,6 +116,7 @@ impl Discovery {
                     }
                     for iface_idx in update.diff.removed {
                         ifaces.lock().retain(|addr| addr.scope_id() != iface_idx);
+                        known_ifaces.lock().remove(&iface_idx);
 
                         if let Err(e) = sock.leave_multicast_v6(&GROUP, iface_idx) {
                             if let Some(iface) = update.interfaces.get(&iface_idx) {
@@ -118,16 +132,56 @@ impl Discovery {
             // todo: better error handling here
             .expect("failed to bind discovery watcher"),
         );
+
+        // Diagnostic only, for the Mode B investigation: an independent task,
+        // polled by the runtime regardless of whatever `next()`'s own future
+        // is doing. If this stops logging during a stall, the whole runtime
+        // is starved; if it keeps logging while `next()` goes silent, the
+        // `next()` future itself stopped being polled (most likely a lost
+        // wakeup somewhere between tokio and the pyo3 async bridge, not a
+        // blocked call inside this file).
+        tokio::spawn(async {
+            let mut n: u64 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                n += 1;
+                debug!("discovery heartbeat #{n}: runtime is still polling tasks");
+            }
+        });
+
         Ok(Self {
             sock,
             namespace,
             ifaces,
+            known_ifaces,
+            discovery_port,
             last_nonce: Mutex::new(rand::random()),
             listen_port,
             zid,
             tick: interval(Duration::from_secs(1)),
+            resync: interval(Duration::from_secs(10)),
             _sync,
         })
+    }
+
+    /// Rebuilds `ifaces` to include every interface `known_ifaces` still
+    /// considers present, regardless of any earlier HostUnreachable prune.
+    /// Membership (`join_multicast_v6`) is a receive-side concern and is left
+    /// alone here; this only concerns the send-side address list.
+    fn resync_ifaces(&self) {
+        let known = self.known_ifaces.lock();
+        let mut ifaces = self.ifaces.lock();
+        let mut restored = 0;
+        for &iface_idx in known.iter() {
+            let candidate = SocketAddrV6::new(GROUP, self.discovery_port, 0, iface_idx);
+            if !ifaces.contains(&candidate) {
+                ifaces.push(candidate);
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            debug!("resync: restored {restored} discovery address(es) from known_ifaces");
+        }
     }
 
     pub async fn next(&mut self) -> io::Result<Discovered> {
@@ -135,13 +189,23 @@ impl Discovery {
         loop {
             tokio::select! {
                 _ = self.tick.tick() => {
+                    debug!("next(): tick fired, entering announce()");
                     self.announce().await?;
+                    debug!("next(): announce() returned");
+                }
+                _ = self.resync.tick() => {
+                    debug!("next(): resync tick fired, entering resync_ifaces()");
+                    self.resync_ifaces();
+                    debug!("next(): resync_ifaces() returned");
                 }
                 res = self.sock.recv_from(&mut buf) => {
+                    debug!("next(): recv_from resolved: {res:?}");
                     let Ok((bytes_read, addr)) = res else { continue; };
                     if let Some(discovered) = self.respond(bytes_read, addr, &buf).await? {
+                        debug!("next(): respond() returned Discovered, exiting loop");
                         return Ok(discovered)
                     }
+                    debug!("next(): respond() returned None");
                 }
             }
         }
@@ -196,7 +260,9 @@ impl Discovery {
                 }
                 .alloc();
 
+                debug!("respond(): entering WhatsUp send/retry loop for {addr}");
                 for i in 1..6 {
+                    debug!("respond(): attempt {i} to {addr}, entering timeout(send_to)");
                     match tokio::time::timeout(SEND_TIMEOUT, self.sock.send_to(&reply, addr)).await
                     {
                         Ok(Ok(sent)) if sent == WhatsUp::buf_size() => {
@@ -213,6 +279,7 @@ impl Discovery {
                     }
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
+                debug!("respond(): WhatsUp send/retry loop for {addr} complete");
                 Ok(None)
             }
             Kind::WhatsUp => {
@@ -264,6 +331,7 @@ impl Discovery {
         debug!("announcing Hello({nonce:?}) to {addrs:?}");
         // rev so .remove() doesn't break things
         for (i, addr) in addrs.into_iter().enumerate().rev() {
+            debug!("announce(): entering timeout(send_to) for {addr}");
             match tokio::time::timeout(SEND_TIMEOUT, self.sock.send_to(&buf, addr)).await {
                 Ok(Ok(bytes)) => trace!("sent {bytes} to {addr}"),
                 Ok(Err(e)) if e.kind() == io::ErrorKind::HostUnreachable => {
@@ -273,7 +341,9 @@ impl Discovery {
                 Ok(Err(e)) => debug!("failed to reach {addr}: {e}"),
                 Err(_) => debug!("send to {addr} timed out after {SEND_TIMEOUT:?}, skipping"),
             }
+            debug!("announce(): timeout(send_to) for {addr} returned");
         }
+        debug!("announce(): send loop complete");
         Ok(())
     }
 }
