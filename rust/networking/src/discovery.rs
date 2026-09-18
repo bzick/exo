@@ -66,7 +66,20 @@ impl Discovery {
         sock.set_reuse_port(true)?;
         sock.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, discovery_port, 0, 0).into())?;
         sock.set_nonblocking(true)?;
-        sock.set_multicast_loop_v6(true)?;
+        // Loopback delivery of our own multicast sends is never used for
+        // anything -- `respond`'s Hello branch already drops a message whose
+        // nonce matches our own last-sent one, precisely because it expected
+        // to see its own packet looped back. On Darwin's IPv6 stack a looped
+        // multicast send can trigger a bogus ICMP6 "unreachable" for the
+        // multicast destination (RFC1122/1812 both say this must never
+        // happen, but old BSD-derived stacks are known to do it anyway), and
+        // that error latches onto the socket and is returned on every
+        // subsequent send from then on -- explaining a HostUnreachable prune
+        // that starts after the very first tick and never once recovers on
+        // its own, on every interface including lo0, while a brand new
+        // socket sends fine at the same instant. Not needed, and the
+        // simplest way to remove the trigger entirely.
+        sock.set_multicast_loop_v6(false)?;
         let sock = Arc::new(UdpSocket::from_std(sock.into())?);
         let ifaces: Arc<Mutex<Vec<SocketAddrV6>>> = Default::default();
         let known_ifaces: Arc<Mutex<HashSet<u32>>> = Default::default();
@@ -260,9 +273,7 @@ impl Discovery {
                 }
                 .alloc();
 
-                debug!("respond(): entering WhatsUp send/retry loop for {addr}");
                 for i in 1..6 {
-                    debug!("respond(): attempt {i} to {addr}, entering timeout(send_to)");
                     match tokio::time::timeout(SEND_TIMEOUT, self.sock.send_to(&reply, addr)).await
                     {
                         Ok(Ok(sent)) if sent == WhatsUp::buf_size() => {
@@ -279,7 +290,6 @@ impl Discovery {
                     }
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
-                debug!("respond(): WhatsUp send/retry loop for {addr} complete");
                 Ok(None)
             }
             Kind::WhatsUp => {
@@ -331,7 +341,6 @@ impl Discovery {
         debug!("announcing Hello({nonce:?}) to {addrs:?}");
         // rev so .remove() doesn't break things
         for (i, addr) in addrs.into_iter().enumerate().rev() {
-            debug!("announce(): entering timeout(send_to) for {addr}");
             match tokio::time::timeout(SEND_TIMEOUT, self.sock.send_to(&buf, addr)).await {
                 Ok(Ok(bytes)) => trace!("sent {bytes} to {addr}"),
                 Ok(Err(e)) if e.kind() == io::ErrorKind::HostUnreachable => {
@@ -341,9 +350,7 @@ impl Discovery {
                 Ok(Err(e)) => debug!("failed to reach {addr}: {e}"),
                 Err(_) => debug!("send to {addr} timed out after {SEND_TIMEOUT:?}, skipping"),
             }
-            debug!("announce(): timeout(send_to) for {addr} returned");
         }
-        debug!("announce(): send loop complete");
         Ok(())
     }
 }
